@@ -881,7 +881,141 @@ cmd_show() {
 
     local file
     file=$(ticket_path "$1") || return 1
-    cat "$file"
+    local target_id
+    target_id=$(basename "$file" .md)
+
+    awk -v target="$target_id" -v target_file="$file" '
+    BEGIN { FS=": "; in_front=0 }
+
+    # First pass: collect all ticket metadata
+    FNR==1 {
+        if (prev_file) store()
+        id=""; status=""; title=""; deps=""; links=""; parent=""; in_front=0
+        prev_file=FILENAME
+    }
+    /^---$/ { in_front = !in_front; next }
+    in_front && /^id:/ { id = $2 }
+    in_front && /^status:/ { status = $2 }
+    in_front && /^deps:/ { deps = $2; gsub(/[\[\] ]/, "", deps) }
+    in_front && /^links:/ { links = $2; gsub(/[\[\] ]/, "", links) }
+    in_front && /^parent:/ { parent = $2 }
+    !in_front && /^# / && title == "" { title = substr($0, 3) }
+
+    function store() {
+        if (id != "") {
+            statuses[id] = status
+            titles[id] = title
+            all_deps[id] = deps
+            all_links[id] = links
+            parents[id] = parent
+        }
+    }
+
+    END {
+        if (prev_file) store()
+
+        # Build inverse relationships
+        for (id in statuses) {
+            # Children: tickets where parent == target
+            if (parents[id] == target) {
+                children_count++
+                children[children_count] = id
+            }
+            # Blocking: tickets where target is in their deps
+            deps = all_deps[id]
+            if (deps != "") {
+                n = split(deps, arr, ",")
+                for (i = 1; i <= n; i++) {
+                    if (arr[i] == target && statuses[id] != "closed") {
+                        blocking_count++
+                        blocking[blocking_count] = id
+                    }
+                }
+            }
+        }
+
+        # Now output the target file with enhancements
+        in_front = 0
+        while ((getline line < target_file) > 0) {
+            if (line == "---") {
+                in_front = !in_front
+                print line
+            } else if (in_front && line ~ /^parent:/) {
+                # Add parent title as comment
+                p = line
+                sub(/^parent: */, "", p)
+                if (p in titles) {
+                    print line "  # " titles[p]
+                } else {
+                    print line
+                }
+            } else {
+                print line
+            }
+        }
+        close(target_file)
+
+        # Collect blockers (unclosed deps)
+        deps = all_deps[target]
+        if (deps != "") {
+            n = split(deps, arr, ",")
+            blocker_count = 0
+            for (i = 1; i <= n; i++) {
+                d = arr[i]
+                if (d != "" && statuses[d] != "closed") {
+                    blocker_count++
+                    blockers[blocker_count] = d
+                }
+            }
+            if (blocker_count > 0) {
+                print ""
+                print "## Blockers"
+                print ""
+                for (i = 1; i <= blocker_count; i++) {
+                    d = blockers[i]
+                    printf "- %s [%s] %s\n", d, statuses[d], titles[d]
+                }
+            }
+        }
+
+        # Show tickets this is blocking
+        if (blocking_count > 0) {
+            print ""
+            print "## Blocking"
+            print ""
+            for (i = 1; i <= blocking_count; i++) {
+                b = blocking[i]
+                printf "- %s [%s] %s\n", b, statuses[b], titles[b]
+            }
+        }
+
+        # Show children
+        if (children_count > 0) {
+            print ""
+            print "## Children"
+            print ""
+            for (i = 1; i <= children_count; i++) {
+                c = children[i]
+                printf "- %s [%s] %s\n", c, statuses[c], titles[c]
+            }
+        }
+
+        # Collect linked tickets
+        links = all_links[target]
+        if (links != "") {
+            n = split(links, arr, ",")
+            print ""
+            print "## Linked"
+            print ""
+            for (i = 1; i <= n; i++) {
+                l = arr[i]
+                if (l != "") {
+                    printf "- %s [%s] %s\n", l, statuses[l], titles[l]
+                }
+            }
+        }
+    }
+    ' "$TICKETS_DIR"/*.md 2>/dev/null
 }
 
 cmd_edit() {
